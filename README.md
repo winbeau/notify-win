@@ -1,54 +1,67 @@
 # notify-win
 
-在 **Ubuntu** 上运行一条命令，向 **Windows 桌面**(`winbeau-win` / `YOUR_WIN_HOST`，用户 `YOUR_WIN_USER`)弹出通知 + 声音。
+在 **Ubuntu** 上运行一条命令，向 **Windows 桌面**弹出通知 + 响铃。
 
 ## 用法
 
 ```bash
-notify-win -m "消息正文"                       # 默认标题、默认声音(Reminder)
-notify-win -t "标题" -m "正文"                 # 自定义标题
-notify-win -t 报警 -m "出错了" -s Alarm2        # 换声音
-notify-win -t 静音 -m "无声通知" -q            # 静音
-echo "管道里的内容" | notify-win -t 提醒        # 从管道读正文
+notify-win -m "消息正文"                 # 默认标题
+notify-win -t "标题" -m "正文"           # 自定义标题
+notify-win -q -m "无声通知"              # 静音(不响铃)
+echo "管道内容" | notify-win -t "提醒"    # 从管道读正文
 
 # 实战
-long_task && notify-win -m "任务完成 ✅" || notify-win -t 失败 -m "任务挂了 ❌" -s Alarm2
+long_task && notify-win -t '✅ 完成' -m '任务跑完了' \
+          || notify-win -t '❌ 失败' -m '任务挂了, 见 log'
 ```
 
-声音可选:`Default IM Mail Reminder SMS Alarm Alarm2..Alarm10 Call Call2..Call10`
-退出码:`0` 成功；非 0 表示 SSH 或远端出错。
+- `-m` 正文（必填，或管道）
+- `-t` 标题（可选，默认 `Ubuntu 通知`）
+- `-q` 静音
+- `-s` 仍可传但**当前不影响声音**（声音已统一，见下）。标题/正文走 base64，中文/emoji/引号/空格全安全。
 
-## 架构 / 为什么要桥接
+## 架构 / 为什么这么绕
 
 ```
-Ubuntu                         Windows (winbeau-win YOUR_WIN_HOST)
-┌──────────┐   SSH(key,:22)   ┌─ Session 0 (服务/SSH) ─┐   ┌─ Session 1 (你的桌面) ─┐
-│notify-win│ ───────────────▶ │ 写队列 .txt           │   │ 计划任务 notify-win    │
-│  (bash)  │  powershell      │ schtasks /run ────────┼──▶│  └ show.ps1            │
-└──────────┘  -EncodedCommand └───────────────────────┘   │     └ BurntToast 弹窗  │
-                                                           └────────────────────────┘
+Ubuntu                         Windows
+┌──────────┐  SSH(key,:22)    ┌─ Session 0 (sshd/服务) ─┐   ┌─ Session 1 (桌面) ──────────┐
+│notify-win│ ───────────────▶ │ 写 base64 消息到队列     │   │ 计划任务 notify-win          │
+│  (bash)  │ powershell        │ schtasks /run ──────────┼──▶│  └ launcher.vbs(隐藏)       │
+└──────────┘ -EncodedCommand  └─────────────────────────┘   │     └ show.ps1               │
+                                                            │        ├ BurntToast 静音弹窗 │
+                                                            │        └ SoundPlayer 响铃    │
+                                                            └─────────────────────────────┘
 ```
 
-关键坑(已解决):
-1. **SSH 登录在 Session 0**,它弹的 toast 在你桌面(Session 1)看不到 → 用**计划任务**桥接到桌面会话。
-2. **PowerShell 通知权限默认可能被关** → Windows 设置里需允许"来自 PowerShell 的通知"(已开)。
-3. 标题/正文各自 **base64(UTF-8)**,远端用 `powershell -EncodedCommand` → 中文/空格/引号全安全。
+踩过的坑(都已解决)：
+1. **SSH 在 Session 0**，弹窗/声音到不了你的桌面(Session 1) → 用**计划任务**桥接到桌面会话。
+2. **免打扰会静音 toast 声音** → 声音**不走 toast**(toast 设 `-Silent`)，改用 `SoundPlayer` 直接放 wav，免打扰管不着。
+3. **任务计划跑 powershell 会闪控制台**(疑似触发"全屏自动免打扰") → 用 `launcher.vbs` 隐藏启动(窗口模式 0)。
+4. **多条通知并发抢音频 → 只响第一条** → `launcher.vbs` 同步等待 + 任务 `MultipleInstances=Queue` + show.ps1 **全局互斥锁 + 排空循环**，严格串行。
+5. **声音忽大忽小** → 播放前把系统主音量设为**绝对 40%**，放完**还原**(与当前音量无关)。
+6. PowerShell 通知权限需在 Windows 设置里允许(否则 toast 不显示；声音不受影响)。
 
 ## 文件
 
 | 位置 | 作用 |
 |---|---|
-| `notify-win` (Ubuntu, 已软链到 `~/.local/bin/`) | CLI 主体 |
-| `~/.config/notify-win/config` (Ubuntu) | 覆盖 host/user/key/默认声音等 |
-| `C:\Users\YOUR_WIN_USER\.notify-win\show.ps1` (Windows) | 计划任务执行体，读队列弹窗(本仓 `show.ps1` 是副本) |
-| `C:\Users\YOUR_WIN_USER\.notify-win\queue\` (Windows) | 消息队列(投递后自动清理) |
-| 计划任务 `notify-win` (Windows) | YOUR_WIN_USER 交互登录运行，把弹窗送到桌面 |
+| `notify-win` (Ubuntu, 软链到 `~/.local/bin/`) | CLI 主体 |
+| `~/.config/notify-win/config` (Ubuntu) | host/user/key 等(见 `config.example`) |
+| `C:\Users\<用户>\.notify-win\launcher.vbs` | 隐藏启动器(任务调它) |
+| `C:\Users\<用户>\.notify-win\show.ps1` | 桥接执行体:弹窗 + 响铃 + 音量控制(本仓有副本) |
+| `C:\Users\<用户>\.notify-win\queue\` | 消息队列(投递后自动清理) |
+| 计划任务 `notify-win` (Queue, 交互登录) | 把弹窗/声音送到桌面 |
+
+## Windows 端依赖
+
+- **OpenSSH Server**(从 GitHub 经代理装，见 `notify-setup-v2.ps1` / `notify-finish.ps1`）
+- **BurntToast**（toast）+ **AudioDeviceCmdlets**（控制主音量）。两者 `Install-Module -Scope CurrentUser`，必要时加 `-Proxy`。
 
 ## 在新机器上重建
 
-1. **Windows 装 OpenSSH Server + BurntToast**:参考 `notify-setup-v2.ps1`(管理员运行，经代理从 GitHub 装 OpenSSH，避开慢/卡的 Windows Update)。
-2. **修主机密钥权限并启动 sshd**:参考 `notify-finish.ps1`(关键是 `FixHostFilePermissions.ps1`)。
-3. **导入公钥**:管理员账户放 `C:\ProgramData\ssh\administrators_authorized_keys` 并收紧 ACL。
-4. **建桥接计划任务 + show.ps1**:任务以 `LogonType Interactive` 运行 `show.ps1`(见上)。
-5. **Windows 设置**:允许"来自 PowerShell 的通知"(否则 toast 被静默)。
-6. 改 `~/.config/notify-win/config` 里的 `WIN_HOST/WIN_USER` 指向新机器。
+1. 装 OpenSSH Server，导入公钥到 `administrators_authorized_keys`（管理员账户），`FixHostFilePermissions.ps1` 修权限后启动 sshd。
+2. `Install-Module BurntToast,AudioDeviceCmdlets -Scope CurrentUser`。
+3. 建 `~/.notify-win\{show.ps1,launcher.vbs,queue}`（本仓副本，改路径里的用户名）。
+4. 注册计划任务 `notify-win`：`wscript.exe "...\launcher.vbs"`，`LogonType Interactive`，`MultipleInstances Queue`。
+5. Windows 设置里允许"来自 PowerShell 的通知"。
+6. 改 `~/.config/notify-win/config` 指向新机器。
