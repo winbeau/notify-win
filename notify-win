@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# notify-win : 在 Ubuntu 上运行，向 Windows 桌面弹一条通知 + 声音。
+# 链路: Ubuntu -SSH(session0)-> 投消息到队列 -> 触发计划任务(桌面session) -> BurntToast 弹窗
+set -euo pipefail
+
+# ---- 默认配置 (可被 ~/.config/notify-win/config 覆盖) ----
+WIN_HOST="YOUR_WIN_HOST"
+WIN_USER="YOUR_WIN_USER"
+WIN_PORT="22"
+SSH_KEY="$HOME/.ssh/id_ed25519"
+SOUND="Reminder"
+APP_TITLE="Ubuntu 通知"
+QUEUE_DIR='C:\Users\YOUR_WIN_USER\.notify-win\queue'   # Windows 端队列目录
+TASK="notify-win"                               # Windows 端计划任务名
+
+CFG="${NOTIFY_WIN_CONFIG:-$HOME/.config/notify-win/config}"
+# shellcheck disable=SC1090
+[ -f "$CFG" ] && . "$CFG"
+
+usage() {
+  cat <<EOF
+用法: notify-win -m <消息> [-t <标题>] [-s <声音>] [-q]
+  -t  标题   (默认: "$APP_TITLE")
+  -m  正文   (必填; 或用管道:  echo 正文 | notify-win)
+  -s  声音   (默认: $SOUND)
+        可选: Default IM Mail Reminder SMS Alarm Alarm2..Alarm10 Call Call2..Call10
+  -q  静音 (无声)
+  -h  帮助
+
+示例:
+  notify-win -t "构建完成" -m "训练跑完啦 ✅"
+  long_task && notify-win -m "任务完成 ✅" || notify-win -t 失败 -m "任务挂了 ❌" -s Alarm2
+  echo "管道里的消息" | notify-win -t 提醒
+EOF
+}
+
+TITLE="$APP_TITLE"; MSG=""; QUIET=0
+while getopts "t:m:s:qh" opt; do
+  case "$opt" in
+    t) TITLE="$OPTARG" ;;
+    m) MSG="$OPTARG" ;;
+    s) SOUND="$OPTARG" ;;
+    q) QUIET=1 ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+# 没给 -m 且有管道输入 -> 用管道内容作正文
+if [ -z "$MSG" ] && [ ! -t 0 ]; then MSG="$(cat)"; fi
+if [ -z "$MSG" ]; then echo "notify-win: 缺少消息 (用 -m 或管道)" >&2; usage; exit 1; fi
+
+# 标题/正文各自 base64(UTF-8)→ 彻底规避引号/换行/中文问题
+TB64="$(printf '%s' "$TITLE" | base64 -w0)"
+MB64="$(printf '%s'  "$MSG"  | base64 -w0)"
+SILENT=0; [ "$QUIET" = "1" ] && SILENT=1
+
+# 队列文件名: 时间戳保证有序、唯一
+UNIQ="$(date +%Y%m%d%H%M%S)-$$-${RANDOM}"
+
+# 队列文件内容 (4 行): titleB64 / msgB64 / sound / silent
+PAYLOAD="$(printf '%s\n%s\n%s\n%s\n' "$TB64" "$MB64" "$SOUND" "$SILENT")"
+PAYLOADB64="$(printf '%s' "$PAYLOAD" | base64 -w0)"
+
+# 远端: 写队列文件 + 触发计划任务
+REMOTE="\$d='$QUEUE_DIR'; [IO.File]::WriteAllBytes(\"\$d\\$UNIQ.txt\",[Convert]::FromBase64String('$PAYLOADB64')); schtasks /run /tn $TASK | Out-Null"
+RB64="$(printf '%s' "$REMOTE" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
+
+exec ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$SSH_KEY" -p "$WIN_PORT" \
+  "$WIN_USER@$WIN_HOST" "powershell -NoProfile -EncodedCommand $RB64"

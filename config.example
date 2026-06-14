@@ -1,0 +1,10 @@
+# notify-win 配置示例
+# 复制到 ~/.config/notify-win/config 并填入你的真实值(此文件会覆盖 notify-win 脚本内默认值)
+WIN_HOST="YOUR_WIN_HOST"                              # Windows IP/主机名(如 Tailscale IP)
+WIN_USER="YOUR_WIN_USER"                              # Windows 用户名
+WIN_PORT="22"
+SSH_KEY="$HOME/.ssh/id_ed25519"                       # 用于登录的私钥
+SOUND="Reminder"                                      # 默认提示音
+APP_TITLE="Ubuntu 通知"                               # 默认标题
+QUEUE_DIR='C:\Users\YOUR_WIN_USER\.notify-win\queue'  # Windows 端队列目录
+TASK="notify-win"                                     # Windows 端计划任务名
